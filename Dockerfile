@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+
 FROM alpine:edge
 
 RUN apk add --no-cache \
@@ -15,6 +17,7 @@ ENV TZ=Asia/Tokyo \
     RCLONE_TRANSFERS=4 \
     RCLONE_CHECKERS=8 \
     RCLONE_LOG_LEVEL=INFO
+
 
 # ---------------------------------------------------------------------------
 # Backup script
@@ -55,7 +58,7 @@ notify_discord() {
         color=15548997
     fi
 
-    # Discord Embedが大きくなりすぎないよう失敗ログを制限
+    # Discord Embedのサイズを抑える
     if (( ${#details} > 1500 )); then
         details="${details:0:1500}…"
     fi
@@ -154,7 +157,6 @@ notify_discord() {
 on_exit() {
     local exit_code=$?
 
-    # EXIT trap の再実行を防止
     trap - EXIT
 
     local end_time
@@ -195,14 +197,9 @@ echo "[$(date -Iseconds)] Starting B2 backup"
 echo "[$(date -Iseconds)] Source:      ${B2_REMOTE_PATH}"
 echo "[$(date -Iseconds)] Destination: ${BACKUP_DIR}"
 
+
 # ---------------------------------------------------------------------------
 # 1. Incremental copy
-#
-# --checksum:
-#   size + checksum で変更の有無を判定する。
-#
-# rclone copy:
-#   B2側から削除されたファイルをローカルから削除しない。
 # ---------------------------------------------------------------------------
 
 PHASE="copy"
@@ -223,20 +220,13 @@ rclone copy \
 echo "[$(date -Iseconds)] Copy completed"
 echo "[$(date -Iseconds)] Starting checksum verification"
 
+
 # ---------------------------------------------------------------------------
 # 2. Checksum verification
 #
-# B2 とローカルのサイズ・ハッシュを比較。
-#
-# B2はSHA-1を提供するため、通常はB2側SHA-1と
-# ローカルで計算したSHA-1が比較される。
-#
 # --one-way:
-#   B2に存在するファイルがローカルに存在し、一致していることだけを
-#   検証する。
-#
-#   rclone copyではB2から削除された古いファイルをローカルに残すため、
-#   ローカルにのみ存在するファイルはエラーにしない。
+#   B2側にあるファイルについてローカルとの整合性を検証。
+#   ローカルにのみ残っている古いファイルは許容する。
 # ---------------------------------------------------------------------------
 
 PHASE="checksum verification"
@@ -266,6 +256,7 @@ RUN cat > /usr/local/bin/entrypoint.sh <<'EOF'
 #!/bin/bash
 set -Eeuo pipefail
 
+
 # ---------------------------------------------------------------------------
 # Validate timezone
 # ---------------------------------------------------------------------------
@@ -278,8 +269,9 @@ fi
 ln -snf "/usr/share/zoneinfo/${TZ}" /etc/localtime
 echo "${TZ}" > /etc/timezone
 
+
 # ---------------------------------------------------------------------------
-# Validate backup time
+# Validate configuration
 # ---------------------------------------------------------------------------
 
 if [[ ! "${BACKUP_TIME}" =~ ^([01][0-9]|2[0-3]):([0-5][0-9])$ ]]; then
@@ -307,14 +299,9 @@ MINUTE="${BACKUP_TIME#*:}"
 
 mkdir -p "${BACKUP_DIR}"
 
+
 # ---------------------------------------------------------------------------
-# Persist container environment for cron
-#
-# cronから起動されるプロセスでもRCLONE_CONFIG_*やWebhook URLなどを
-# 確実に利用できるよう、必要な環境変数をBash形式で保存する。
-#
-# printf %q を使うことで特殊文字を含むApplication Key/Webhook URLも
-# 安全に復元する。
+# Save environment for cron
 # ---------------------------------------------------------------------------
 
 ENV_FILE="/run/backup-env.sh"
@@ -333,8 +320,9 @@ for name in $(compgen -e); do
     esac
 done
 
+
 # ---------------------------------------------------------------------------
-# Create cron entry
+# Create cron schedule
 # ---------------------------------------------------------------------------
 
 cat > /etc/crontabs/root <<EOF_CRON
@@ -342,6 +330,7 @@ ${MINUTE} ${HOUR} * * * /bin/bash -c 'source /run/backup-env.sh && exec /usr/loc
 EOF_CRON
 
 chmod 0600 /etc/crontabs/root
+
 
 echo "B2 backup container started"
 echo "  Timezone : ${TZ}"
@@ -351,7 +340,41 @@ echo "  Target   : ${BACKUP_DIR}"
 echo "  Verify   : checksum"
 echo "  Discord  : enabled"
 
-# BusyBox crondをforegroundで実行
+
+# ---------------------------------------------------------------------------
+# Initial backup
+#
+# BACKUP_DIR が完全に空の場合のみ、cronの時刻を待たずに即時実行する。
+#
+# - 通常の初回起動:
+#       empty -> immediate backup
+#
+# - 2回目以降:
+#       files exist -> skip
+#
+# findを使用することで、通常ファイルだけでなく
+# .hidden-file 等の隠しファイルも検出する。
+# ---------------------------------------------------------------------------
+
+if [[ -z "$(find "${BACKUP_DIR}" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+    echo "[$(date -Iseconds)] Backup directory is empty"
+    echo "[$(date -Iseconds)] Running initial backup immediately"
+
+    /usr/local/bin/run-backup.sh
+
+    echo "[$(date -Iseconds)] Initial backup completed successfully"
+else
+    echo "[$(date -Iseconds)] Backup directory is not empty"
+    echo "[$(date -Iseconds)] Skipping initial backup"
+fi
+
+
+# ---------------------------------------------------------------------------
+# Start cron
+# ---------------------------------------------------------------------------
+
+echo "[$(date -Iseconds)] Starting cron scheduler"
+
 exec crond -f -l 2
 EOF
 
