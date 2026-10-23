@@ -1,4 +1,4 @@
-name: Docker CI (ghcr)
+name: Docker CI
 permissions: {}
 on:
   workflow_dispatch:
